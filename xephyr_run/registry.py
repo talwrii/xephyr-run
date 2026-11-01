@@ -46,7 +46,7 @@ def load(name, where=None):
         record = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-    if not alive(record['server_pid']):
+    if not alive(record['pid']):
         path.unlink(missing_ok=True)
         return None
     return record

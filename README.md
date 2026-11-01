@@ -11,7 +11,8 @@ window. The client talks to the nested X server, not your session, so it cannot
 snoop your keystrokes, screenshot other windows or read your clipboard, as long as it is also
 stopped from connecting to your main X server (see [Confinement](#confinement-the-default); this
 is on by default). Your window manager places the Xephyr window like any other, and the client is
-stretched to fill it, following resizes. Xephyr exits when the client does.
+stretched to fill it, following resizes. Xephyr is started **lazily**, only when the client first connects to X, so a
+program that never uses X never causes a window. Xephyr exits when the client does.
 
 ## Installation
 `pipx install xephyr-run`
@@ -25,7 +26,8 @@ filter described below on first use.
 xephyr-run run -- xeyes
 xephyr-run run -n term -- xterm -fa 'DejaVu Sans Mono' -fs 10
 xephyr-run run --no-confine -- some-trusted-x-program   # switch the connect filter off
-xephyr-run list                    # name, display, Xephyr pid, command
+xephyr-run run --always-start-xephyr -- xterm           # start Xephyr at once, to debug
+xephyr-run list                    # name, display, Xephyr pid ("not started" until the client connects), command
 xephyr-run attach term -- xwininfo -root -tree
 xephyr-run kill term
 ```
@@ -48,6 +50,23 @@ may do persently). However, I felt this feature on its own was a useful demonstr
 ed:  used Xerphyr direction with a jail
 
 ed: there was some socker of docker thing that did this
+
+## Lazy start
+
+`xephyr-run` opens the display's socket (`/tmp/.X11-unix/X90`, and so on) itself and starts the client.
+A client that connects simply waits in the socket's queue. When `xephyr-run` sees a connection waiting,
+it starts Xephyr and hands over the already-open socket, so Xephyr accepts the waiting connection
+itself. There is no proxy in between, so shared memory and descriptor passing work as usual. Use
+`--always-start-xephyr` to skip the waiting and start it at once.
+
+The socket is handed over using the `LISTEN_FDS` convention: it is descriptor 3 of the new process, with
+the environment variables `LISTEN_FDS=1` and `LISTEN_PID=<pid>` saying so. It began with systemd, but nothing
+here uses systemd. (Xephyr has no `-listenfd` option; that exists only in Xwayland.) It needs a Xephyr
+built with that support, which Ubuntu's is. Xephyr runs with `-noreset`: otherwise it resets when its last
+client disconnects, which closes the handed-over socket and leaves later connections waiting for ever.
+
+Connecting to the display from outside (`xephyr-run attach`) also starts it. A client that tries X and then
+never creates a window keeps the Xephyr running until the client exits.
 
 ## Why a plain Xephyr is not enough
 By itself, Xephyr does not prevent arbitrary code from connecting to your main X11 server. With a

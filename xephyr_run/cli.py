@@ -8,30 +8,16 @@ import sys
 import time
 from pathlib import Path
 
-from . import connect_filter, registry
+from . import connect_filter, lazy, registry
 
-SOCKETS = Path('/tmp/.X11-unix')
+SOCKETS = lazy.SOCKETS
+free_display = lazy.free_display
 
 
 def parse_size(text):
     if not re.fullmatch(r'\d+x\d+', text):
         raise ValueError('Size must look like 640x400')
     return text
-
-
-def free_display(sockets=SOCKETS, first=90):
-    number = first
-    while (sockets/f'X{number}').exists():
-        number += 1
-    return number
-
-
-def wait_for(path, timeout=5):
-    deadline = time.time() + timeout
-    while not path.exists():
-        if time.time() > deadline:
-            raise RuntimeError('Xephyr did not start')
-        time.sleep(0.05)
 
 
 def screen_size(display):
@@ -43,21 +29,34 @@ def screen_size(display):
 def fill(display, width, height):
     """Stretch the client's top-level window over the nested screen; there is no window manager inside to do it."""
     env = dict(os.environ, DISPLAY=display)
-    found = subprocess.run(['xdotool', 'search', '--sync', '--onlyvisible', '--maxdepth', '1', '--name', '.'],
+    # No --sync: killing a client that is waiting (as a timeout does) leaves this Xephyr unresponsive.
+    # An empty answer just means the window is not there yet, and follow() asks again.
+    found = subprocess.run(['xdotool', 'search', '--onlyvisible', '--maxdepth', '1', '--name', '.'],
                            env=env, capture_output=True, text=True, timeout=10)
     window = found.stdout.split()[0]
     subprocess.run(['xdotool', 'windowmove', window, '0', '0', 'windowsize', window, width, height],
                    env=env, check=True)
 
 
-def follow(client, display):
-    """Keep the client filling the nested screen as its Xephyr window is resized, until the client exits."""
-    last = None
+def follow(client, display, on_start=lambda: None, eager=False):
+    """Start the Xephyr when the client first connects to its display (at once if eager), then keep
+    the client filling the nested screen as its window is resized, until the client exits. A client
+    that never uses X never gets a Xephyr, unless eager."""
+    started, last = False, None
     while client.poll() is None:
-        current = screen_size(display)
-        if current != last:
-            fill(display, *current)
-            last = current
+        if not started:
+            if not eager and not display.connection_waiting(0.1):
+                continue
+            display.start()
+            on_start()
+            started = True
+        try:
+            current = screen_size(display.display)
+            if current != last:
+                fill(display.display, *current)
+                last = current
+        except (subprocess.TimeoutExpired, IndexError):
+            pass   # the client has no window yet; look again shortly
         time.sleep(0.2)
     return client.returncode
 
@@ -81,25 +80,29 @@ def run(args):
     name = registry.validate_name(args.name or Path(command[0]).name)
     if registry.load(name):
         raise ValueError(f'{name} is already running; use a different --name or kill it first')
-    size = parse_size(args.size)
     number = free_display()
-    display = f':{number}'
-    server = subprocess.Popen(['Xephyr', display, '-screen', size, '-title', f'xephyr-run-{name}',
-                               '-resizeable', '-no-host-grab'])
+    display = lazy.LazyXephyr(number, parse_size(args.size), f'xephyr-run-{name}')
+    # So a kill still cleans up. A shell starts background jobs with SIGINT ignored, so ask for it again.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    display.open()
+    record = {'name': name, 'display': display.display, 'server_pid': None, 'pid': os.getpid(),
+              'command': command, 'started': time.time()}
+    client = None
     try:
-        wait_for(SOCKETS/f'X{number}')
-        registry.save({'name': name, 'display': display, 'server_pid': server.pid, 'pid': os.getpid(),
-                       'command': command, 'started': time.time()})
-        environment = dict(os.environ, DISPLAY=display)
+        registry.save(record)
+        environment = dict(os.environ, DISPLAY=display.display)
         if args.confine:
             client = connect_filter.popen_confined_rules(command, confine_rules(number), env=environment)
         else:
             client = subprocess.Popen(command, env=environment)
-        return follow(client, display)
+        return follow(client, display, lambda: registry.save(dict(record, server_pid=display.server.pid)),
+                      eager=args.always_start_xephyr)
     finally:
         registry.remove(name)
-        server.terminate()
-        server.wait()
+        if client and client.poll() is None:
+            client.terminate()
+        display.close()
 
 
 def find(name):
@@ -111,12 +114,14 @@ def find(name):
 
 def list_instances(args):
     for record in registry.records():
-        print(f'{record["name"]}\t{record["display"]}\t{record["server_pid"]}\t{" ".join(record["command"])}')
+        server = record['server_pid'] or 'not started'
+        print(f'{record["name"]}\t{record["display"]}\t{server}\t{" ".join(record["command"])}')
     return 0
 
 
 def kill(args):
-    os.kill(find(args.name)['server_pid'], signal.SIGTERM)
+    """Ask the xephyr-run process to stop; it stops the client and its Xephyr and cleans up."""
+    os.kill(find(args.name)['pid'], signal.SIGTERM)
     return 0
 
 
@@ -130,6 +135,8 @@ def parser():
     runner = sub.add_parser('run', help='Start a Xephyr and run a command in it')
     runner.add_argument('-n', '--name', help='Instance name (default: the command name)')
     runner.add_argument('-s', '--size', default='640x400', help='Initial size (default: %(default)s)')
+    runner.add_argument('--always-start-xephyr', action='store_true',
+                        help='Start Xephyr at once instead of when the client first connects to X (for debugging)')
     runner.add_argument('--no-confine', dest='confine', action='store_false',
                         help='Allow the client to connect to your other X servers (confined by default, see README)')
     sub.add_parser('list', help='List running instances: name, display, Xephyr pid, command')

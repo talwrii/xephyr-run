@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from xephyr_run import cli, connect_filter, registry
@@ -25,6 +26,61 @@ class Display(unittest.TestCase):
             self.assertEqual(cli.free_display(sockets, first=5), 7)
 
 
+class Following(unittest.TestCase):
+    class Client:
+        def __init__(self, polls):
+            self.polls = polls
+            self.returncode = 0
+
+        def poll(self):
+            self.polls -= 1
+            return None if self.polls > 0 else 0
+
+    class Display:
+        display = ':90'
+
+        def __init__(self, waiting):
+            self.waiting = waiting
+            self.started = 0
+
+        def connection_waiting(self, timeout):
+            return self.waiting
+
+        def start(self):
+            self.started += 1
+
+    def follow(self, display, **kwargs):
+        with unittest.mock.patch.object(cli, 'screen_size', return_value=('640', '400')), \
+             unittest.mock.patch.object(cli, 'fill') as fill, \
+             unittest.mock.patch.object(cli.time, 'sleep'):
+            cli.follow(self.Client(4), display, **kwargs)
+        return fill
+
+    def test_no_xephyr_while_the_client_has_not_connected(self):
+        display = self.Display(waiting=False)
+        fill = self.follow(display)
+        self.assertEqual(display.started, 0)
+        fill.assert_not_called()
+
+    def test_xephyr_starts_once_when_the_client_connects(self):
+        display = self.Display(waiting=True)
+        fill = self.follow(display)
+        self.assertEqual(display.started, 1)
+        fill.assert_called_once_with(':90', '640', '400')
+
+    def test_always_start_does_not_wait_for_a_connection(self):
+        display = self.Display(waiting=False)
+        self.follow(display, eager=True)
+        self.assertEqual(display.started, 1)
+
+    def test_a_client_without_a_window_is_retried_not_fatal(self):
+        display = self.Display(waiting=True)
+        with unittest.mock.patch.object(cli, 'screen_size', return_value=('640', '400')), \
+             unittest.mock.patch.object(cli, 'fill', side_effect=IndexError), \
+             unittest.mock.patch.object(cli.time, 'sleep'):
+            self.assertEqual(cli.follow(self.Client(4), display), 0)
+
+
 class Confinement(unittest.TestCase):
     def policy_for(self, number):
         with tempfile.TemporaryDirectory() as directory:
@@ -44,9 +100,9 @@ class Confinement(unittest.TestCase):
 
 
 class Registry(unittest.TestCase):
-    def record(self, name, server_pid=None):
-        return {'name': name, 'display': ':90', 'server_pid': server_pid or os.getpid(),
-                'pid': os.getpid(), 'command': ['xclock'], 'started': 0}
+    def record(self, name, pid=None):
+        return {'name': name, 'display': ':90', 'server_pid': None,
+                'pid': pid or os.getpid(), 'command': ['xclock'], 'started': 0}
 
     def test_round_trip_and_listing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -62,7 +118,7 @@ class Registry(unittest.TestCase):
     def test_stale_record_is_pruned(self):
         with tempfile.TemporaryDirectory() as directory:
             where = Path(directory)
-            registry.save(self.record('gone', server_pid=2**22 + 12345), where)
+            registry.save(self.record('gone', pid=2**22 + 12345), where)
             self.assertIsNone(registry.load('gone', where))
             self.assertFalse((where/'gone.json').exists())
 
