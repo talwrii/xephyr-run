@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xephyr-run"
+version = "0.1.0"
+description = "Run one X client in its own named Xephyr window at a chosen position"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["ziglang"]
+
+[project.scripts]
+xephyr-run = "xephyr_run.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["xephyr_run*"]
+
+[tool.setuptools.package-data]
+xephyr_run = ["*.c"]
