@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 from xephyr_run import connect_filter as cf
@@ -93,6 +94,20 @@ class Server(threading.Thread):
         self.listener.close()
 
 
+def settle(*servers, quiet=0.3, limit=5):
+    """Wait until the servers have accepted everything queued for them. Connections wait in a socket's
+    queue, so counting the moment the client exits could miss some, which would hide a leak."""
+    deadline = time.monotonic() + limit
+    last, stable_since = None, time.monotonic()
+    while time.monotonic() < deadline:
+        counts = tuple(server.accepted for server in servers)
+        if counts != last:
+            last, stable_since = counts, time.monotonic()
+        elif time.monotonic() - stable_since >= quiet:
+            return
+        time.sleep(0.05)
+
+
 def unix_server(address):
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(address)
@@ -153,7 +168,8 @@ class RaceHarness(unittest.TestCase):
         for server in servers.values():
             self.addCleanup(server.stop)
         subprocess.run([sys.executable, '-c', RACE, os.path.join(directory, 'good.sock'),
-                        os.path.join(directory, 'evil.sock'), '150'], check=True, timeout=60)
+                        os.path.join(directory, 'evil.sock'), '3000'], check=True, timeout=60)
+        settle(*servers.values())
         self.assertGreater(servers['evil'].accepted, 0)
         self.assertGreater(servers['good'].accepted, 0)
 
@@ -202,10 +218,12 @@ class ConfinedTests:
         results = json.loads(self.run_confined(CONNECTS, json.dumps(targets)))
         self.assertEqual(results, {'allowed': 'ok', 'denied': 'EACCES', 'abstract': 'ECONNREFUSED',
                                    'tcp': 'ok', 'io_uring': 'EPERM'})
+        settle(*self.servers.values())
         self.assertEqual(self.servers['denied'].accepted, 0)
 
     def test_changing_the_address_during_the_check_cannot_reach_a_denied_socket(self):
         self.run_confined(RACE, self.allowed, self.denied, '150')
+        settle(*self.servers.values())
         self.assertEqual(self.servers['denied'].accepted, 0)
         self.assertGreater(self.servers['allowed'].accepted, 0)
 
